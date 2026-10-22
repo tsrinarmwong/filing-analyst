@@ -62,7 +62,7 @@ BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.fireworks.ai/inference/v1
 # defaults are verified at runtime by the --check preflights (build_index.py,
 # check_provider.py) so a retired/renamed id fails fast with a clear message.
 CHAT_MODEL = os.environ.get(
-    "LLM_CHAT_MODEL", "accounts/fireworks/models/kimi-k2-instruct"
+    "LLM_CHAT_MODEL", "accounts/fireworks/models/kimi-k3"
 )
 EMBED_MODEL = os.environ.get(
     "LLM_EMBED_MODEL", "accounts/fireworks/models/qwen3-embedding-8b"
