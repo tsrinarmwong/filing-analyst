@@ -1,17 +1,24 @@
-"""FastAPI app: a JSON chat endpoint plus a dependency-free chat UI.
+"""FastAPI app: a streaming chat endpoint plus a dependency-free chat UI that
+shows the agent's work.
 
     uvicorn app.server:app --port 8000   ->   http://localhost:8000
+
+The UI streams the agent's TRACE live -- each tool call, where the data came
+from (the SQL database vs. the 10-K filings), the exact SQL / search query, and
+the result -- so you can see it route and reason, then read the grounded answer.
 
 The server starts fine WITHOUT a built index or DB -- those load lazily on the
 first query and fail soft with a friendly message instead of a 500.
 """
 from __future__ import annotations
 
+import json
+
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app.agent import answer_question
+from app.agent import answer_question, stream_question
 
 app = FastAPI(title="Filing Analyst")
 
@@ -22,16 +29,31 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/chat")
 def chat(req: ChatRequest) -> dict:
-    """Contract: {"question": "..."} in, {"answer": "...", "evidence": [...]} out."""
+    """Non-streaming JSON: {"question": "..."} -> {"answer": ..., "evidence": [...]}."""
     try:
         result = answer_question(req.question)
-    except FileNotFoundError as exc:          # index / DB not built yet
+    except (FileNotFoundError, RuntimeError) as exc:
         return {"answer": f"⚠️ {exc}", "evidence": []}
-    except RuntimeError as exc:                # e.g. missing API key
-        return {"answer": f"⚠️ {exc}", "evidence": []}
-    except Exception as exc:                   # never surface a raw 500 to the UI
+    except Exception as exc:  # never surface a raw 500
         return {"answer": f"⚠️ Something went wrong: {exc}", "evidence": []}
     return {"answer": result["answer"], "evidence": result.get("evidence", [])}
+
+
+@app.post("/api/chat/stream")
+def chat_stream(req: ChatRequest) -> StreamingResponse:
+    """Server-Sent Events: streams the agent's trace events, then the answer."""
+    def gen():
+        try:
+            for event in stream_question(req.question):
+                yield f"data: {json.dumps(event)}\n\n"
+        except (FileNotFoundError, RuntimeError) as exc:
+            yield f"data: {json.dumps({'type': 'answer', 'text': f'⚠️ {exc}', 'evidence': []})}\n\n"
+        except Exception as exc:  # noqa: BLE001
+            yield f"data: {json.dumps({'type': 'answer', 'text': f'⚠️ Something went wrong: {exc}', 'evidence': []})}\n\n"
+        yield 'data: {"type": "done"}\n\n'
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 PAGE = r"""<!doctype html>
@@ -42,17 +64,19 @@ PAGE = r"""<!doctype html>
 <title>Filing Analyst</title>
 <style>
   :root {
-    --bg:#0f1115; --panel:#171a21; --ink:#e7e9ee; --muted:#9aa3b2;
-    --line:#262b36; --accent:#5b9dff; --user:#2b4a7a; --code:#0c0e12; --err:#ff6b6b;
+    --bg:#0f1115; --panel:#171a21; --raise:#1d212b; --ink:#e7e9ee; --muted:#9aa3b2;
+    --line:#262b36; --accent:#5b9dff; --user:#2b4a7a; --code:#0c0e12;
+    --sql:#5b9dff; --search:#b182ff; --ok:#56d19a; --err:#ff6b6b;
   }
   @media (prefers-color-scheme: light) {
-    :root { --bg:#f5f6f8; --panel:#ffffff; --ink:#1b1f27; --muted:#5f6878;
-            --line:#e4e7ec; --accent:#2563eb; --user:#2563eb; --code:#f2f3f6; --err:#c0392b; }
+    :root { --bg:#f5f6f8; --panel:#ffffff; --raise:#f3f5f9; --ink:#1b1f27; --muted:#5f6878;
+            --line:#e4e7ec; --accent:#2563eb; --user:#2563eb; --code:#f2f3f6;
+            --sql:#2563eb; --search:#7c3aed; --ok:#128a5a; --err:#c0392b; }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
          font:15px/1.6 system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
-  .wrap { max-width:820px; margin:0 auto; height:100vh; display:flex; flex-direction:column; }
+  .wrap { max-width:860px; margin:0 auto; height:100vh; display:flex; flex-direction:column; }
   header { padding:20px 22px 14px; border-bottom:1px solid var(--line); }
   header h1 { margin:0; font-size:18px; font-weight:650; letter-spacing:-0.01em; }
   header p { margin:6px 0 0; color:var(--muted); font-size:13px; }
@@ -60,22 +84,45 @@ PAGE = r"""<!doctype html>
   #log { flex:1; overflow-y:auto; padding:18px 22px; }
   .row { display:flex; margin:14px 0; }
   .row.user { justify-content:flex-end; }
-  .stack { display:flex; flex-direction:column; gap:8px; max-width:92%; }
+  .stack { display:flex; flex-direction:column; gap:8px; max-width:94%; width:100%; }
+  .row.user .stack { align-items:flex-end; }
   .bubble { padding:11px 15px; border-radius:14px; border:1px solid var(--line);
             background:var(--panel); overflow-wrap:anywhere; }
-  .user .bubble { background:var(--user); color:#fff; border-color:transparent; white-space:pre-wrap; }
+  .user .bubble { background:var(--user); color:#fff; border-color:transparent;
+                  white-space:pre-wrap; max-width:88%; }
   .muted { color:var(--muted); }
   .thinking { animation:pulse 1.1s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{opacity:.5} 50%{opacity:1} }
-  details.ev { font-size:12.5px; color:var(--muted); border-top:1px dashed var(--line); padding-top:6px; }
-  details.ev summary { cursor:pointer; user-select:none; color:var(--accent); }
-  .ev-item { margin:8px 0 0; padding-left:10px; border-left:2px solid var(--line); }
-  .tag { display:inline-block; font-size:10.5px; font-weight:700; letter-spacing:.03em;
-         color:#fff; background:var(--muted); border-radius:5px; padding:1px 6px; margin-right:6px; }
-  .ev-item pre { margin:6px 0 0; padding:8px 10px; background:var(--code); border-radius:8px;
-                 overflow-x:auto; font-size:12px; }
-  .ev-item ul { margin:6px 0 0; padding-left:18px; }
-  .ev-err { color:var(--err); margin-top:4px; }
+  @keyframes pulse { 0%,100%{opacity:.45} 50%{opacity:1} }
+
+  /* --- agent trace --- */
+  .trace { display:flex; flex-direction:column; gap:8px; }
+  .status { color:var(--muted); font-size:12.5px; display:flex; align-items:center; gap:7px; }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--accent); }
+  .plan { color:var(--muted); font-size:12.5px; font-style:italic;
+          border-left:2px solid var(--line); padding-left:9px; }
+  .step { border:1px solid var(--line); border-radius:12px; background:var(--raise);
+          padding:9px 12px; }
+  .step .head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12.5px; }
+  .tag { font-size:10px; font-weight:800; letter-spacing:.06em; color:#fff;
+         border-radius:5px; padding:2px 7px; }
+  .tag.sql { background:var(--sql); } .tag.search { background:var(--search); }
+  .step .label { font-weight:600; }
+  .step .src { color:var(--muted); font-size:11.5px; }
+  .step .src::before { content:"→ "; }
+  .step pre { margin:8px 0 0; padding:9px 11px; background:var(--code); border-radius:8px;
+              overflow-x:auto; font-size:12px;
+              font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--sql); }
+  .step .query { margin-top:7px; color:var(--search);
+                 font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; }
+  .step .result { margin-top:8px; font-size:12px; color:var(--muted); }
+  .step .result .ok { color:var(--ok); font-weight:600; }
+  .step .rows { margin-top:5px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                font-size:11.5px; color:var(--muted); white-space:pre; overflow-x:auto; }
+  .step .srclist { margin:5px 0 0; padding-left:16px; font-size:11.5px; color:var(--muted); }
+  .step .snippet { margin-top:6px; font-size:11.5px; color:var(--muted); font-style:italic; }
+  .step.err pre, .step.err .result { color:var(--err); }
+
+  /* --- markdown answer --- */
   .md :first-child { margin-top:0; } .md :last-child { margin-bottom:0; }
   .md p { margin:8px 0; } .md h1,.md h2,.md h3 { margin:12px 0 6px; font-size:15px; }
   .md ul,.md ol { margin:6px 0; padding-left:22px; } .md li { margin:3px 0; }
@@ -86,6 +133,7 @@ PAGE = r"""<!doctype html>
   .md table { border-collapse:collapse; margin:10px 0; font-size:13px; display:block; overflow-x:auto; }
   .md th,.md td { border:1px solid var(--line); padding:5px 9px; text-align:left; }
   .md th { background:var(--code); }
+
   form { display:flex; gap:8px; padding:14px 22px; border-top:1px solid var(--line); }
   textarea { flex:1; resize:none; padding:11px 13px; border:1px solid var(--line); border-radius:12px;
              font:inherit; background:var(--panel); color:var(--ink); }
@@ -99,9 +147,9 @@ PAGE = r"""<!doctype html>
 <div class="wrap">
   <header>
     <h1>Filing Analyst</h1>
-    <p>Grounded Q&amp;A over <b>NVIDIA, AMD, and Intel</b> 10-K filings. Routes to a read-only
-       <b>SQL</b> tool for exact figures and <b>semantic search</b> over filing text for narrative,
-       and shows the evidence behind every answer.</p>
+    <p>Grounded Q&amp;A over <b>NVIDIA, AMD, and Intel</b> 10-K filings. Watch it route between a
+       read-only <b>SQL</b> tool (exact figures from <b>financials.db</b>) and <b>semantic search</b>
+       over the <b>filing text</b> — every step of its work is shown.</p>
   </header>
   <div id="log"></div>
   <form id="form">
@@ -116,21 +164,24 @@ const form = document.getElementById('form');
 const input = document.getElementById('q');
 const send = document.getElementById('send');
 
-function addRow(role) {
-  const row = document.createElement('div'); row.className = 'row ' + role;
-  const stack = document.createElement('div'); stack.className = 'stack';
-  const bubble = document.createElement('div'); bubble.className = 'bubble';
-  stack.appendChild(bubble); row.appendChild(stack); log.appendChild(row);
-  log.scrollTop = log.scrollHeight;
-  return { bubble, stack };
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
 }
-
+function addRow(role) {
+  const row = el('div', 'row ' + role);
+  const stack = el('div', 'stack');
+  row.appendChild(stack); log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+  return stack;
+}
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// Safe Markdown subset. ALL model output is HTML-escaped first, then a limited
-// set of constructs is re-applied -- no raw HTML can get through. Code spans and
+// --- Safe Markdown subset. Model output is HTML-escaped first; code spans /
 // fenced blocks are shielded with @@C#@@ / @@F#@@ sentinels so they never
-// collide with real content like "$215.9B" or "65.5%".
+// collide with content like "$215.9B" or "65.5%". ---
 function inline(t) {
   const code = [];
   t = t.replace(/`([^`]+)`/g, (_, c) => { code.push(c); return '@@C' + (code.length-1) + '@@'; });
@@ -142,13 +193,11 @@ function inline(t) {
 function cells(line) { return line.replace(/^\s*\|/,'').replace(/\|\s*$/,'').split('|').map(c=>c.trim()); }
 const isSep = l => /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/.test(l);
 const isLi = l => /^\s*([-*+]|\d+\.)\s+/.test(l);
-
 function md(src) {
   src = esc(src).replace(/\r\n/g,'\n');
   const fences = [];
   src = src.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, c) => {
-    fences.push('<pre><code>' + c.replace(/\n$/,'') + '</code></pre>');
-    return '@@F' + (fences.length-1) + '@@';
+    fences.push('<pre><code>' + c.replace(/\n$/,'') + '</code></pre>'); return '@@F' + (fences.length-1) + '@@';
   });
   const L = src.split('\n'); const out = []; let i = 0;
   while (i < L.length) {
@@ -167,60 +216,107 @@ function md(src) {
       out.push(ol ? '<ol>'+items.join('')+'</ol>' : '<ul>'+items.join('')+'</ul>'); continue;
     }
     const para = [];
-    while (i < L.length && L[i].trim() && !isLi(L[i]) && !/^(#{1,3})\s+/.test(L[i]) && !/^@@F\d+@@$/.test(L[i])) { para.push(L[i]); i++; }
+    while (i < L.length && L[i].trim() && !isLi(L[i]) && !/^(#{1,3})\s+/.test(L[i]) && !/^@@F(\d+)@@$/.test(L[i])) { para.push(L[i]); i++; }
     out.push('<p>'+inline(para.join('\n')).replace(/\n/g,'<br>')+'</p>');
   }
   return out.join('\n').replace(/@@F(\d+)@@/g, (_, k) => fences[+k]);
 }
 
-function renderEvidence(stack, evidence) {
-  if (!Array.isArray(evidence) || !evidence.length) return;
-  const det = document.createElement('details'); det.className = 'ev';
-  const sum = document.createElement('summary');
-  sum.textContent = 'Evidence · ' + evidence.length + ' tool call' + (evidence.length>1?'s':'');
-  det.appendChild(sum);
-  evidence.forEach(ev => {
-    const item = document.createElement('div'); item.className = 'ev-item';
-    if (ev.tool === 'query_financials') {
-      item.innerHTML = '<span class="tag">SQL</span>';
-      const pre = document.createElement('pre'); pre.textContent = ev.sql || '(no query)'; item.appendChild(pre);
-      if (ev.error) { const e = document.createElement('div'); e.className='ev-err'; e.textContent='error: '+ev.error; item.appendChild(e); }
-    } else if (ev.tool === 'search_filings') {
-      item.innerHTML = '<span class="tag">SEARCH</span>';
-      item.appendChild(document.createTextNode(ev.query || ''));
-      const ul = document.createElement('ul');
-      (ev.sources || []).forEach(s => {
-        const li = document.createElement('li');
-        li.textContent = s.ticker + ' FY' + s.fiscal_year + ' · ' + (s.section||'') + ' · chunk ' + s.chunk + ' · ' + s.score;
-        ul.appendChild(li);
-      });
-      item.appendChild(ul);
-    } else { item.textContent = JSON.stringify(ev); }
-    det.appendChild(item);
-  });
-  stack.appendChild(det);
+// --- trace rendering ---
+function toolCard(ev) {
+  const step = el('div', 'step');
+  const head = el('div', 'head');
+  const isSql = ev.tool === 'query_financials';
+  head.appendChild(el('span', 'tag ' + (isSql ? 'sql' : 'search'), isSql ? 'SQL' : 'SEARCH'));
+  head.appendChild(el('span', 'label', ev.label || ev.tool));
+  if (ev.source) head.appendChild(el('span', 'src', ev.source));
+  step.appendChild(head);
+  if (isSql) {
+    step.appendChild(el('pre', null, ev.sql || '(no query)'));
+  } else {
+    const filt = [ev.company, ev.year ? 'FY' + ev.year : null].filter(Boolean);
+    step.appendChild(el('div', 'query', '"' + (ev.query || '') + '"' + (filt.length ? '  [' + filt.join(', ') + ']' : '')));
+  }
+  return step;
+}
+function fillResult(step, ev) {
+  if (!step) return;
+  const r = el('div', 'result');
+  if (ev.tool === 'query_financials') {
+    step.classList.toggle('err', !!ev.error);
+    if (ev.error) { r.textContent = '✗ ' + ev.error; step.appendChild(r); return; }
+    const n = ev.row_count || 0;
+    r.innerHTML = '<span class="ok">✓ ' + n + ' row' + (n===1?'':'s') + '</span> &nbsp;' +
+                  (ev.columns||[]).map(esc).join(', ');
+    step.appendChild(r);
+    if ((ev.preview||[]).length) {
+      const rows = ev.preview.map(row => Object.entries(row).map(([k,v]) => k+'='+v).join('   '));
+      step.appendChild(el('div', 'rows', rows.join('\n')));
+    }
+  } else {
+    const srcs = ev.sources || [];
+    r.innerHTML = '<span class="ok">✓ ' + srcs.length + ' passage' + (srcs.length===1?'':'s') + '</span>';
+    step.appendChild(r);
+    const ul = el('ul', 'srclist');
+    srcs.forEach(s => ul.appendChild(el('li', null,
+      s.ticker + ' FY' + s.fiscal_year + ' · ' + (s.section||'') + ' · chunk ' + s.chunk + ' · ' + s.score)));
+    step.appendChild(ul);
+    if (ev.top_snippet) step.appendChild(el('div', 'snippet', ev.top_snippet));
+  }
 }
 
 let busy = false;
 async function ask() {
   const question = input.value.trim(); if (!question || busy) return;
   busy = true; send.disabled = true;
-  addRow('user').bubble.textContent = question;
+  addRow('user').appendChild(Object.assign(el('div','bubble'), { textContent: question }));
   input.value = '';
-  const pending = addRow('bot');
-  pending.bubble.className = 'bubble muted thinking';
-  const t0 = Date.now();
-  const timer = setInterval(() => { pending.bubble.textContent = 'Thinking… ' + Math.floor((Date.now()-t0)/1000) + 's'; }, 400);
+
+  const stack = addRow('bot');
+  const trace = el('div', 'trace'); stack.appendChild(trace);
+  const status = el('div', 'status thinking');
+  status.appendChild(el('span', 'dot')); status.appendChild(el('span', null, 'Planning the approach…'));
+  trace.appendChild(status);
+  const answer = el('div', 'bubble md'); answer.style.display = 'none'; stack.appendChild(answer);
+  let lastStep = null;
+  const setStatus = t => { status.lastChild.textContent = t; };
+
+  function handle(ev) {
+    if (ev.type === 'plan') {
+      const p = el('div', 'plan', ev.text); trace.insertBefore(p, status); setStatus('Working…');
+    } else if (ev.type === 'tool_call') {
+      lastStep = toolCard(ev); trace.insertBefore(lastStep, status);
+      setStatus(ev.tool === 'query_financials' ? 'Querying the database…' : 'Searching the filings…');
+    } else if (ev.type === 'tool_result') {
+      fillResult(lastStep, ev);
+    } else if (ev.type === 'synthesizing') {
+      setStatus('Synthesizing the answer…');
+    } else if (ev.type === 'answer') {
+      status.remove();
+      answer.style.display = ''; answer.innerHTML = md(ev.text || '(no answer)');
+    }
+    log.scrollTop = log.scrollHeight;
+  }
+
   try {
-    const res = await fetch('/api/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ question }) });
-    const data = await res.json();
-    clearInterval(timer);
-    pending.bubble.className = 'bubble md';
-    pending.bubble.innerHTML = md(data.answer || '(no answer)');
-    renderEvidence(pending.stack, data.evidence);
+    const res = await fetch('/api/chat/stream', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question }) });
+    const reader = res.body.getReader(); const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        if (!chunk.startsWith('data:')) continue;
+        const ev = JSON.parse(chunk.slice(5).trim());
+        if (ev.type !== 'done') handle(ev);
+      }
+    }
+    if (status.isConnected) status.remove();
   } catch (err) {
-    clearInterval(timer);
-    pending.bubble.className = 'bubble ev-err'; pending.bubble.textContent = 'Error: ' + err;
+    setStatus('Error: ' + err); status.classList.remove('thinking');
   } finally {
     busy = false; send.disabled = false; log.scrollTop = log.scrollHeight;
   }

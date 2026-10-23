@@ -4,12 +4,49 @@
 
 > _Covers **NVIDIA (NVDA), AMD, Intel (INTC)** — the two most recent annual 10-Ks for each, plus a few years of financial history from SEC XBRL data._
 
+The web UI and the CLI both **stream the agent's trace** — you watch it route between SQL and the filings, see the exact query it ran and where the data came from, then read the grounded answer.
+
 <!-- DEMO GIF PLACEHOLDER -->
 <table><tr><td align="center" width="760">
-<br>🎬 &nbsp; <b>Demo</b> &nbsp;·&nbsp; a screen recording of the chat UI goes here<br>
-<sub>Run <code>make serve</code> to try it live, then drop a recording at <code>docs/demo.gif</code> and
+<br>🎬 &nbsp; <b>Demo</b> &nbsp;·&nbsp; a screen recording of the live web trace goes here<br>
+<sub>Run <code>make serve</code> to try it, then drop a recording at <code>docs/demo.gif</code> and
 replace this block with <code>![demo](docs/demo.gif)</code>.</sub><br><br>
 </td></tr></table>
+
+Here's the same trace from the terminal (`python -m app.ask "…"`). Note the agent **recovering from a dead end** — its first query returns no rows, so it introspects the schema, finds the right member, and re-queries:
+
+```text
+┌─ Filing Analyst ────────────────────────────────────────────
+│ What was NVIDIA's data-center revenue in FY2026 versus FY2025, and what does the filing attribute the change to?
+└──────────────────────────────────────────────────────────────
+
+▸  SQL  SQL query  →  financials.db (SEC XBRL)
+    SELECT fiscal_year, period_end, member, value FROM segment_revenue
+    WHERE ticker='NVDA' AND dimension='business_segment' AND member='Data Center' ...
+    ✓ 0 rows
+
+▸  SEARCH  Semantic search  →  10-K filings (vector index)
+    "Data Center revenue increase AI infrastructure Blackwell accelerated computing"  [NVDA, FY2026]
+    ✓ 5 passages   NVDA FY2026 · Item 7 · chunk 211 (0.67), Item 1 · chunk 27 (0.61) ...
+
+plan  The segment query returned no rows — let me check the exact member names used for NVDA.
+
+▸  SQL  SQL query  →  financials.db (SEC XBRL)
+    SELECT DISTINCT dimension, member FROM segment_revenue WHERE ticker='NVDA' ...
+    ✓ 14 rows   (business_segment / product / geography members)
+
+▸  SQL  SQL query  →  financials.db (SEC XBRL)
+    SELECT fiscal_year, period_end, member, value FROM segment_revenue
+    WHERE ticker='NVDA' AND dimension='product' AND member='Data Center' ...
+    ✓ 2 rows   FY2025 $115.186B · FY2026 $193.737B
+
+── Answer ────────────────────────────────────────────────────────────
+NVIDIA's Data Center revenue was $193.7B in FY2026, up 68% from $115.2B in FY2025.
+The FY2026 10-K (Item 7) attributes it to the shift to accelerated computing and AI:
+compute +59% on Blackwell demand, networking +142% on NVLink for GB200/GB300 — partly
+offset by a $4.5B H20 inventory charge in Q1 FY2026.
+──────────────────────────────────────────────────────────────────────
+```
 
 ---
 
@@ -62,7 +99,13 @@ make check                   # (optional) verify the provider + model ids resolv
 make serve                   # chat UI at http://localhost:8000
 ```
 
-Other targets: `make eval` (grade the agent), `make test` (unit tests), `make help` (list all). Or call the API directly:
+Other targets: `make eval` (grade the agent), `make test` (unit tests), `make help` (list all). Prefer the terminal? Ask with a live trace:
+
+```bash
+.venv/bin/python -m app.ask "Which of NVIDIA, AMD, and Intel grew revenue fastest, and why?"
+```
+
+Or call the API directly:
 
 ```bash
 curl -s localhost:8000/api/chat -H 'Content-Type: application/json' \
@@ -126,8 +169,9 @@ app/sql_tool.py             read-only text-to-SQL (two-layer guard + schema hint
 app/retriever.py            Retriever protocol + NumpyCosineRetriever
 app/chunker.py              structure-aware 10-K chunker
 app/search_tool.py          filing-search tool over the Retriever
-app/agent.py                tool-calling loop → {answer, evidence}
-app/server.py               FastAPI: POST /api/chat + chat UI with evidence panel
+app/agent.py                tool-calling loop; streams a trace → {answer, evidence}
+app/ask.py                  CLI: ask with a live trace in the terminal
+app/server.py               FastAPI: /api/chat(+/stream) + chat UI with live trace
 scripts/fetch_filings.py    download 10-Ks from SEC EDGAR → data/raw/
 scripts/build_financials_db.py  SEC XBRL → SQLite (metrics + segment/geo revenue)
 scripts/build_index.py      chunk → embed → vector index

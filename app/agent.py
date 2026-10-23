@@ -150,7 +150,45 @@ def _dispatch(name: str, args: dict):
     return {"error": f"unknown tool {name}"}, {"tool": name, "error": "unknown tool"}
 
 
-def answer_question(question: str, max_iters: int = MAX_ITERS) -> dict:
+# --- trace events -------------------------------------------------------------
+# The agent emits a stream of events so the UI and CLI can show what it's doing:
+# where the data comes from, which tool branch it took, the exact SQL / search
+# query, and the result summary. This is the whole point of the trace view.
+_SOURCE = {
+    "query_financials": "financials.db (SEC XBRL)",
+    "search_filings": "10-K filings (vector index)",
+}
+
+
+def _tool_call_event(name: str, args: dict) -> dict:
+    if name == "query_financials":
+        return {"type": "tool_call", "tool": name, "label": "SQL query",
+                "source": _SOURCE[name], "sql": args.get("sql", "")}
+    if name == "search_filings":
+        return {"type": "tool_call", "tool": name, "label": "Semantic search",
+                "source": _SOURCE[name], "query": args.get("query", ""),
+                "company": args.get("company"), "year": args.get("year")}
+    return {"type": "tool_call", "tool": name, "label": name, "args": args}
+
+
+def _tool_result_event(name: str, result: dict) -> dict:
+    if name == "query_financials":
+        rows = result.get("rows", []) or []
+        return {"type": "tool_result", "tool": name,
+                "columns": result.get("columns", []), "preview": rows[:5],
+                "row_count": result.get("row_count"), "error": result.get("error")}
+    if name == "search_filings":
+        res = result.get("results", []) or []
+        return {"type": "tool_result", "tool": name,
+                "sources": [{**r["source"], "score": r["score"]} for r in res],
+                "top_snippet": (res[0]["text"][:220] + "…") if res else ""}
+    return {"type": "tool_result", "tool": name, "result": result}
+
+
+def stream_question(question: str, max_iters: int = MAX_ITERS):
+    """Run the agent loop, yielding trace events as they happen:
+    'plan' (model reasoning before a tool call), 'tool_call', 'tool_result',
+    'synthesizing', and finally 'answer' (with the full evidence list)."""
     client = get_client()
     messages = [
         {"role": "system", "content": _system_prompt()},
@@ -160,21 +198,21 @@ def answer_question(question: str, max_iters: int = MAX_ITERS) -> dict:
 
     for _ in range(max_iters):
         resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
+            model=CHAT_MODEL, messages=messages, tools=TOOLS, tool_choice="auto",
             temperature=0,  # deterministic so eval runs reproduce
             max_tokens=MAX_ANSWER_TOKENS,
         )
         msg = resp.choices[0].message
 
         if not msg.tool_calls:  # no tool calls -> this is the final answer
-            return {"answer": msg.content or "", "evidence": evidence}
+            yield {"type": "answer", "text": msg.content or "", "evidence": evidence}
+            return
+
+        if msg.content and msg.content.strip():  # the model narrated its plan
+            yield {"type": "plan", "text": msg.content.strip()}
 
         messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
+            "role": "assistant", "content": msg.content or "",
             "tool_calls": [
                 {"id": tc.id, "type": "function",
                  "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
@@ -186,8 +224,10 @@ def answer_question(question: str, max_iters: int = MAX_ITERS) -> dict:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+            yield _tool_call_event(tc.function.name, args)
             result, ev = _dispatch(tc.function.name, args)
             evidence.append(ev)
+            yield _tool_result_event(tc.function.name, result)
             messages.append({
                 "role": "tool", "tool_call_id": tc.id,
                 "content": json.dumps(result, default=str),
@@ -195,13 +235,23 @@ def answer_question(question: str, max_iters: int = MAX_ITERS) -> dict:
 
     # Hit the iteration cap: force a final synthesis with tools disabled so the
     # user always gets an answer, not a dangling tool request.
+    yield {"type": "synthesizing"}
     final = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages + [{
             "role": "user",
             "content": "Give your best final answer now using the evidence gathered above.",
         }],
-        temperature=0,
-        max_tokens=MAX_ANSWER_TOKENS,
+        temperature=0, max_tokens=MAX_ANSWER_TOKENS,
     )
-    return {"answer": final.choices[0].message.content or "", "evidence": evidence}
+    yield {"type": "answer", "text": final.choices[0].message.content or "", "evidence": evidence}
+
+
+def answer_question(question: str, max_iters: int = MAX_ITERS) -> dict:
+    """Non-streaming wrapper over stream_question() -> {answer, evidence}.
+    Used by the eval harness and the plain JSON API."""
+    answer, evidence = "", []
+    for event in stream_question(question, max_iters):
+        if event["type"] == "answer":
+            answer, evidence = event["text"], event.get("evidence", [])
+    return {"answer": answer, "evidence": evidence}

@@ -26,11 +26,14 @@ mid-plan, a final synthesis step runs with tools disabled so the user always get
 real answer instead of a dangling tool request. `temperature=0` keeps eval runs
 reproducible.
 
-**Evidence.** Every tool call is recorded — the exact SQL string and row count, or
-the search query and the ranked source list (ticker, fiscal year, section, chunk,
-score) — and returned alongside the answer. The UI renders this in a collapsible
-panel. The point is that a reader can audit *how* an answer was reached, not just
-read a confident paragraph.
+**Evidence, streamed live.** The agent is a generator that emits trace events as it
+runs — `plan`, `tool_call` (with the exact SQL or search query and which data source
+it hit), `tool_result` (row preview or ranked sources with scores), and the final
+`answer`. The web UI (over Server-Sent Events) and the `app.ask` CLI both render this
+as a live step-by-step trace, so you watch the agent route, branch, and recover from
+dead ends rather than just reading a confident paragraph. A non-streaming
+`answer_question()` wrapper drains the same generator for the eval harness and the
+plain JSON API, so there is exactly one code path.
 
 ## 2. Safety model
 
