@@ -189,3 +189,7 @@ docs/DESIGN.md              routing, safety, chunking, fiscal years, eval method
 ```
 
 Data (`data/raw/`, `data/index/`, `*.db`) is git-ignored and rebuilt by the pipeline. All source data is public SEC filings.
+
+## License
+
+[MIT](LICENSE). Source data is public SEC EDGAR filings; this project is not affiliated with or endorsed by any of the companies it covers.
