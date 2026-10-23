@@ -19,10 +19,8 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.agent import answer_question, stream_question
-from app.dashboard import router as dashboard_router
 
 app = FastAPI(title="Filing Analyst")
-app.include_router(dashboard_router)
 
 
 class ChatRequest(BaseModel):
@@ -81,8 +79,6 @@ PAGE = r"""<!doctype html>
   .wrap { max-width:860px; margin:0 auto; height:100vh; display:flex; flex-direction:column; }
   header { padding:20px 22px 14px; border-bottom:1px solid var(--line); }
   header h1 { margin:0; font-size:18px; font-weight:650; letter-spacing:-0.01em; }
-  header .htop { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
-  header .navlink { color:var(--accent); text-decoration:none; font-size:13px; font-weight:600; }
   header p { margin:6px 0 0; color:var(--muted); font-size:13px; }
   header b { color:var(--ink); font-weight:600; }
   #log { flex:1; overflow-y:auto; padding:18px 22px; }
@@ -150,7 +146,7 @@ PAGE = r"""<!doctype html>
 <body>
 <div class="wrap">
   <header>
-    <div class="htop"><h1>Filing Analyst</h1><a class="navlink" href="/dashboard">Dashboard →</a></div>
+    <h1>Filing Analyst</h1>
     <p>Grounded Q&amp;A over <b>NVIDIA, AMD, and Intel</b> 10-K filings. Watch it route between a
        read-only <b>SQL</b> tool (exact figures from <b>financials.db</b>) and <b>semantic search</b>
        over the <b>filing text</b> — every step of its work is shown.</p>
