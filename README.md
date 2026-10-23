@@ -96,7 +96,7 @@ make install                 # create .venv and install dependencies
 cp .env.example .env         # then edit: set SEC_USER_AGENT and FIREWORKS_API_KEY
 make all                     # fetch filings → build DB → build vector index
 make check                   # (optional) verify the provider + model ids resolve
-make serve                   # chat UI at http://localhost:8000
+make serve                   # chat UI at http://localhost:8000 (+ /dashboard)
 ```
 
 Other targets: `make eval` (grade the agent), `make test` (unit tests), `make help` (list all). Prefer the terminal? Ask with a live trace:
@@ -127,6 +127,10 @@ Switching providers is config-only — no code changes. Set `LLM_BASE_URL`, `LLM
 > <sub>**Evidence** · 2 SQL queries (`segment_revenue`, `metrics`) + semantic search → NVDA FY2026 10-K Item 7, Item 1, Item 1A.</sub>
 
 Note the fiscal-calendar alignment: NVIDIA's **FY2026 ends January 2026**, so it's compared against the right periods even though AMD and Intel label the same span "FY2025."
+
+## Dashboard
+
+Alongside the chat, `/dashboard` is a prebuilt analytics view straight from `financials.db` — revenue and gross-margin trends, R&D intensity, segment revenue, and geographic mix across all three companies. Charts are **server-rendered inline SVG** (no chart library, no CDN), theme-aware, with a data-table toggle under each. Colors use a CVD-validated categorical palette. It makes the fiscal-year and competitive story legible at a glance — e.g., NVIDIA's revenue line pulling away while Intel carries the highest R&D-to-revenue ratio. (Segment revenue is shown only where a company's segments form a clean partition; Intel's is omitted because its reported segment revenue includes large intersegment amounts.)
 
 ## Evaluation
 
@@ -172,6 +176,7 @@ app/search_tool.py          filing-search tool over the Retriever
 app/agent.py                tool-calling loop; streams a trace → {answer, evidence}
 app/ask.py                  CLI: ask with a live trace in the terminal
 app/server.py               FastAPI: /api/chat(+/stream) + chat UI with live trace
+app/dashboard.py            /dashboard: server-rendered SVG analytics from the DB
 scripts/fetch_filings.py    download 10-Ks from SEC EDGAR → data/raw/
 scripts/build_financials_db.py  SEC XBRL → SQLite (metrics + segment/geo revenue)
 scripts/build_index.py      chunk → embed → vector index
