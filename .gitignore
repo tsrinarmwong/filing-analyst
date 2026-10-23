@@ -15,6 +15,9 @@ data/raw/
 data/index/
 *.db
 
+# verbose, regenerable eval dump (eval/results/summary.md is the committed deliverable)
+eval/results/latest.json
+
 # os / editor
 .DS_Store
 .idea/
