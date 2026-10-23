@@ -94,6 +94,26 @@ PAGE = r"""<!doctype html>
   .thinking { animation:pulse 1.1s ease-in-out infinite; }
   @keyframes pulse { 0%,100%{opacity:.45} 50%{opacity:1} }
 
+  /* --- RAG pipeline (per-request system flow) --- */
+  .pipe { display:flex; flex-wrap:wrap; align-items:center; gap:6px 7px; padding:11px 12px;
+          border:1px solid var(--line); border-radius:12px; background:var(--raise); margin-bottom:2px; }
+  .pnode { font-size:11.5px; padding:6px 10px; border-radius:9px; border:1px solid var(--line);
+           background:var(--panel); color:var(--muted); white-space:nowrap; opacity:.5;
+           transition:opacity .25s, border-color .25s, color .25s, box-shadow .25s; }
+  .pnode b { color:var(--muted); font-weight:700; margin-right:5px; }
+  .pcol { display:flex; flex-direction:column; gap:6px; }
+  .parr { color:var(--muted); opacity:.45; font-size:12px; }
+  .pnode .cnt { margin-left:5px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .pnode.active { opacity:1; color:var(--ink); border-color:var(--accent);
+                  box-shadow:0 0 0 2px color-mix(in srgb, var(--accent) 26%, transparent);
+                  animation:pulse 1.1s ease-in-out infinite; }
+  .pnode.done { opacity:1; color:var(--ink); border-color:var(--accent); }
+  .pnode.done b { color:var(--accent); }
+  .pnode.skip { opacity:.28; }
+  .pnode.sqlb.active, .pnode.sqlb.done { border-color:var(--sql); }
+  .pnode.searchb.active, .pnode.searchb.done { border-color:var(--search); }
+  .pnode.sqlb .cnt { color:var(--sql); } .pnode.searchb .cnt { color:var(--search); }
+
   /* --- agent trace --- */
   .trace { display:flex; flex-direction:column; gap:8px; }
   .status { color:var(--muted); font-size:12.5px; display:flex; align-items:center; gap:7px; }
@@ -265,6 +285,49 @@ function fillResult(step, ev) {
   }
 }
 
+// --- RAG pipeline view: the architecture, lit up as the request flows through ---
+function pnode(k, label, cls) {
+  const n = el('div', 'pnode' + (cls ? ' ' + cls : ''));
+  n.dataset.k = k; n.innerHTML = label; return n;
+}
+function buildPipeline(stack) {
+  const pipe = el('div', 'pipe');
+  const nodes = {
+    ingest:    pnode('ingest', '<b>1</b>Question'),
+    interpret: pnode('interpret', '<b>2</b>Interpret'),
+    route:     pnode('route', '<b>3</b>Route'),
+    sql:       pnode('sql', 'SQL · financials.db<span class="cnt"></span>', 'sqlb'),
+    search:    pnode('search', 'Filings · search<span class="cnt"></span>', 'searchb'),
+    combine:   pnode('combine', '<b>4</b>Combine'),
+    answer:    pnode('answer', '<b>5</b>Answer + cites'),
+  };
+  const arr = () => el('div', 'parr', '→');
+  const col = el('div', 'pcol'); col.appendChild(nodes.sql); col.appendChild(nodes.search);
+  [nodes.ingest, arr(), nodes.interpret, arr(), nodes.route, arr(), col, arr(), nodes.combine, arr(), nodes.answer]
+    .forEach(n => pipe.appendChild(n));
+  stack.appendChild(pipe);
+  const counts = { sql: 0, search: 0 };
+  const set = (k, s) => { const n = nodes[k]; n.classList.remove('active', 'done', 'skip'); if (s) n.classList.add(s); };
+  const branchKey = tool => (tool === 'query_financials' ? 'sql' : 'search');
+  return {
+    set,
+    branchCall(tool) {
+      const k = branchKey(tool); counts[k]++;
+      nodes[k].classList.remove('skip'); nodes[k].classList.add('active');
+      nodes[k].querySelector('.cnt').textContent = counts[k] > 1 ? ' ×' + counts[k] : '';
+    },
+    branchResult(tool) {
+      const k = branchKey(tool); nodes[k].classList.remove('active'); nodes[k].classList.add('done');
+    },
+    finish() {
+      ['sql', 'search'].forEach(k => {
+        if (counts[k] === 0) set(k, 'skip');
+        else if (!nodes[k].classList.contains('done')) nodes[k].classList.add('done');
+      });
+    },
+  };
+}
+
 let busy = false;
 async function ask() {
   const question = input.value.trim(); if (!question || busy) return;
@@ -273,9 +336,11 @@ async function ask() {
   input.value = '';
 
   const stack = addRow('bot');
+  const pipe = buildPipeline(stack);
+  pipe.set('ingest', 'done'); pipe.set('interpret', 'active');
   const trace = el('div', 'trace'); stack.appendChild(trace);
   const status = el('div', 'status thinking');
-  status.appendChild(el('span', 'dot')); status.appendChild(el('span', null, 'Planning the approach…'));
+  status.appendChild(el('span', 'dot')); status.appendChild(el('span', null, 'Interpreting the question…'));
   trace.appendChild(status);
   const answer = el('div', 'bubble md'); answer.style.display = 'none'; stack.appendChild(answer);
   let lastStep = null;
@@ -283,15 +348,21 @@ async function ask() {
 
   function handle(ev) {
     if (ev.type === 'plan') {
+      pipe.set('interpret', 'done'); pipe.set('route', 'active');
       const p = el('div', 'plan', ev.text); trace.insertBefore(p, status); setStatus('Working…');
     } else if (ev.type === 'tool_call') {
+      pipe.set('interpret', 'done'); pipe.set('route', 'done'); pipe.set('combine', ''); pipe.branchCall(ev.tool);
       lastStep = toolCard(ev); trace.insertBefore(lastStep, status);
       setStatus(ev.tool === 'query_financials' ? 'Querying the database…' : 'Searching the filings…');
     } else if (ev.type === 'tool_result') {
+      pipe.branchResult(ev.tool); pipe.set('combine', 'active');
       fillResult(lastStep, ev);
+      setStatus('Combining the evidence…');
     } else if (ev.type === 'synthesizing') {
-      setStatus('Synthesizing the answer…');
+      pipe.set('combine', 'active'); setStatus('Combining the evidence…');
     } else if (ev.type === 'answer') {
+      pipe.set('interpret', 'done'); pipe.set('route', 'done');
+      pipe.set('combine', 'done'); pipe.set('answer', 'done'); pipe.finish();
       status.remove();
       answer.style.display = ''; answer.innerHTML = md(ev.text || '(no answer)');
     }

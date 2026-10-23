@@ -4,7 +4,7 @@
 
 > _Covers **NVIDIA (NVDA), AMD, Intel (INTC)** — the two most recent annual 10-Ks for each, plus a few years of financial history from SEC XBRL data._
 
-The web UI and the CLI both **stream the agent's trace** — you watch it route between SQL and the filings, see the exact query it ran and where the data came from, then read the grounded answer.
+The web UI **streams the agent's trace as a live pipeline** — ingest → interpret → route → retrieve (SQL and/or filings) → combine → answer — with each stage lighting up as the request flows through it, the exact query it ran shown beneath, and the branch it skipped dimmed. The CLI streams the same trace in the terminal.
 
 <!-- DEMO GIF PLACEHOLDER -->
 <table><tr><td align="center" width="760">
@@ -58,31 +58,38 @@ A language model is great at *reading* a 10-K's risk factors but will happily ha
 
 Every quantitative claim comes from a read-only SQL query against a database built from SEC's structured XBRL data; every qualitative claim is retrieved from the actual filing text and cited by section. The user sees both, so the answer is auditable rather than taken on faith.
 
-## Architecture
+## Architecture — how a question flows
+
+The core is the RAG loop, and the web UI **animates exactly this pipeline per request** (each stage lights up live; the branch it didn't use dims):
 
 ```mermaid
-flowchart TD
-    Q["User question"] --> AG
+flowchart TB
+    Q["① Question ingested"] --> I["② Interpret<br/>model reads the intent"]
+    I --> R{"③ Route<br/>which source(s)?"}
+    R -->|exact numbers| SQL["query_financials<br/>read-only SQL · 2-layer guard"]
+    R -->|"narrative / 'why'"| SE["search_filings<br/>exact cosine over embeddings"]
+    SQL <--> DB[("financials.db<br/>SEC XBRL")]
+    SE <--> IX[("vector index<br/>numpy · ~2.5k chunks")]
+    SQL --> C["④ Combine<br/>reconcile numbers + text across sources<br/>— the hard part"]
+    SE --> C
+    C -->|needs more evidence| R
+    C --> A["⑤ Grounded answer<br/>+ SQL &amp; filing citations"]
+```
 
-    subgraph AGENT["Agent loop (function calling, iteration cap + forced synthesis)"]
-      AG["Chat model<br/>plans and routes"]
-    end
+Each stage maps to a real design challenge the system is built to clear:
 
-    AG -->|"numbers"| SQL["query_financials<br/>read-only SQL (2-layer guard)"]
-    AG -->|"narrative"| SEARCH["search_filings<br/>exact cosine over embeddings"]
-    SQL --> DB[("financials.db<br/>SQLite · XBRL")]
-    SEARCH --> IDX[("vector index<br/>numpy · 2.5k chunks")]
-    SQL -->|rows| AG
-    SEARCH -->|passages| AG
-    AG --> ANS["Grounded answer<br/>+ evidence trail"]
+1. **Interpret** — a function-calling model turns a messy question into a plan (it also handles scope: off-topic or role-hijack requests are declined).
+2. **Route** — *"vectorize the fuzzy thing, query the exact thing."* Numbers go to SQL, narrative to semantic search; many questions need both.
+3. **Retrieve** — exact figures from a read-only SQL tool; relevant passages from the filing index. Each is grounded, not generated.
+4. **Combine** — the agent loops: it can re-route with what it learned (e.g. an empty result → inspect the schema → re-query) and reconcile figures with the narrative that explains them. This multi-step cross-source synthesis is where naive RAG breaks.
+5. **Answer** — a concise response where every number cites the SQL and every claim cites a filing section, so it's auditable.
 
-    subgraph BUILD["Offline build pipeline"]
-      direction LR
-      F["fetch_filings<br/>(EDGAR)"] --> B1["build_financials_db<br/>(companyfacts + inline XBRL)"]
-      F --> B2["build_index<br/>(chunk → embed)"]
-    end
-    B1 -.-> DB
-    B2 -.-> IDX
+```mermaid
+flowchart LR
+    F["fetch_filings<br/>(EDGAR)"] --> D["build_financials_db<br/>(companyfacts + inline XBRL)"]
+    F --> X["build_index<br/>(chunk → embed)"]
+    D -.-> DB[("financials.db")]
+    X -.-> IX[("vector index")]
 ```
 
 The agent depends only on two tool functions and a `Retriever` protocol — not on numpy, SQLite, or any provider SDK directly — so the pieces swap independently.
